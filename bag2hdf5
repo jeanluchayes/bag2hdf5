@@ -5,6 +5,7 @@ import sys
 import numpy as np
 import argparse
 import h5py
+import struct
 
 import roslib
 
@@ -18,6 +19,11 @@ FLOAT_TIME = True  # False to prevent saving of float redundant timestamps
 
 
 def flatten_msg(msg, t, max_strlen=None):
+    offset_x = 0;
+    offset_y = 0;
+    offset_z = 0;
+    offset_n = 0;
+    
     assert max_strlen is not None  # don't accept default
     result = []
     for i, attr in enumerate(msg.__slots__):
@@ -81,6 +87,38 @@ def flatten_msg(msg, t, max_strlen=None):
         elif rostype == 'sensor_msgs/ChannelFloat32[]':
             p = getattr(msg, attr)
             #This is naturally empty
+
+        elif rostype == 'sensor_msgs/PointField[]':
+            p = getattr(msg, attr)
+            offset_x = p[0].offset
+            offset_y = p[1].offset
+            offset_z = p[2].offset
+            if msg.height != 1:
+                offset_n = p[3].offset
+            for i in range(len(p)):
+                result.extend([p[i].name, p[i].offset, p[i].datatype, p[i].count])
+        
+        #This pointcloud conversion is useful for small pointclouds such as the sonar from the P3-DX
+        #Not to be run on giant pointclouds, such as the lidar
+        elif rostype == 'uint8[]':
+            p = getattr(msg, attr)
+            point_step = msg.point_step
+            row_step = msg.row_step
+
+            #data = np.fromstring(p[0] + p[1] + p[2] + p[3], dtype=np.float32).byteswap()
+            for i in range(0, len(p), point_step):
+                x = np.fromstring(p[i + offset_x] + p[i + offset_x + 1] + p[i + offset_x + 2] + p[i + offset_x + 3], dtype=np.float32)
+                y = np.fromstring(p[i + offset_y] + p[i + offset_y + 1] + p[i + offset_y + 2] + p[i + offset_y + 3], dtype=np.float32)
+                z = np.fromstring(p[i + offset_z] + p[i + offset_z + 1] + p[i + offset_z + 2] + p[i + offset_z + 3], dtype=np.float32)
+                result.extend([x, y, z])
+                if msg.height != 1:
+                    u = 0
+                    n = np.fromstring(p[i + offset_n] + p[i + offset_n + 1] + p[i + offset_n + 2] + p[i + offset_n + 3], dtype=np.float32)
+                    e1 = 0
+                    e2 = 0
+                    e3 = 0
+                    result.extend([u, n, e1, e2, e3])
+                    
         
         else:
             p = getattr(msg, attr)
@@ -98,6 +136,20 @@ def flatten_msg(msg, t, max_strlen=None):
         result.append(t.secs + t.nsecs * 1e-9)
 
     return tuple(result)
+    
+def frombitstoint(s):
+    result = []
+    for c in s:
+        bits = bin(ord(c))[2:]
+        bits = '00000000'[len(bits):] + bits
+        result.extend([int(b) for b in bits])
+        out = 0
+        for bit in result:
+            out = (out << 1) | bit
+    return out
+
+def a2bits(chars):
+     return bin(reduce(lambda x, y : (x<<8)+y, (ord(c) for c in chars), 1))[3:]
         
 
 def rostype2dtype(rostype, max_strlen=None):
@@ -153,6 +205,7 @@ def make_dtype(msg, max_strlen=None):
             if FLOAT_TIME:
                 result.append(('time', np.float64))
                 
+                
         elif rostype == 'geometry_msgs/PoseWithCovariance':
             p = getattr(msg, attr)
             pose = p.pose
@@ -203,14 +256,40 @@ def make_dtype(msg, max_strlen=None):
         elif rostype == 'geometry_msgs/Point32[]':
             p = getattr(msg, attr)
             for i in range(len(p)):
-                result.extend([(attr+'_x_' + str(i), np.float32),
-                               (attr+'_y_' + str(i), np.float32),
-                               (attr+'_z_' + str(i), np.float32)])
+                result.extend([(attr+'_x_'+str(i), np.float32),
+                               (attr+'_y_'+str(i), np.float32),
+                               (attr+'_z_'+str(i), np.float32)])
         
         elif rostype == 'sensor_msgs/ChannelFloat32[]':
             p = getattr(msg, attr)
             #This is naturally empty
-                                       
+        
+        elif rostype == 'sensor_msgs/PointField[]':
+            p = getattr(msg, attr)
+            for i in range(len(p)):
+                result.extend([(attr+'_name_'+str(i), 'S'+str(max_strlen)),
+                           (attr+'_offset_'+str(i), np.uint32),
+                           (attr+'_datatype_'+str(i), np.uint8),
+                           (attr+'_count_'+str(i), np.uint32)])
+        
+        #This pointcloud conversion is useful for small pointclouds such as the sonar from the P3-DX
+        #Not to be run on giant pointclouds, such as the lidar                
+        elif rostype == 'uint8[]':
+            p = getattr(msg, attr)
+            point_step = msg.point_step
+            row_step = msg.row_step
+            for i in range(0, len(p), point_step):
+                i = i / point_step
+                result.extend([(attr+'_x_'+str(i), np.float32),
+                               (attr+'_y_'+str(i), np.float32),
+                               (attr+'_z_'+str(i), np.float32)])
+                if msg.height != 1:
+                    result.extend([(attr+'_u_'+str(i), np.float32),
+                                   (attr+'_i_'+str(i), np.float32),
+                                   (attr+'_e1_'+str(i), np.float32),
+                                   (attr+'_e2_'+str(i), np.float32),
+                                   (attr+'_e3_'+str(i), np.float32)])                           
+                      
         else:
             nptype = rostype2dtype(rostype, max_strlen=max_strlen)
             result.append((attr, nptype))
@@ -242,7 +321,9 @@ def bag2hdf5(fname, out_fname, topics=None, max_strlen=None):
 
     try:
         with h5py.File(out_fname, mode='w') as out_f:
+
             for topic, msg, t in bag.read_messages(topics=topics):
+            
                 # update progressbar
                 pbar.update(bag._file.tell())
                 # get the data
@@ -258,7 +339,8 @@ def bag2hdf5(fname, out_fname, topics=None, max_strlen=None):
                         print >> sys.stderr, '\nROW:', this_row
                         print >> sys.stderr, "*********************************"
                         raise
-                    results2[topic] = dict(dtype=dtype, object=[this_row])
+                    results2[topic] = dict(dtype=dtype,
+                                           object=[this_row])
                 else:
                     results2[topic]['object'].append(this_row)
 
@@ -320,7 +402,7 @@ if __name__ == '__main__':
     if args.out is not None:
         output_fname = args.out
     else:
-        output_fname = fname + '.hdf5'
+        output_fname = fname + '.h5'
         if os.path.exists(output_fname):
             print >> sys.stderr, 'will not overwrite %s' % output_fname
             sys.exit(1)
